@@ -8,7 +8,7 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
-from stp_similarity import LLMReranker  # noqa: E402
+from stp_similarity import EmbeddingIndex, LLMReranker  # noqa: E402
 from app.schemas import SearchRequest  # noqa: E402
 
 
@@ -40,6 +40,44 @@ class RerankCompletionTests(unittest.TestCase):
             path.write_bytes(b"\x93\xa1\x00not-a-step-file")
             with self.assertRaisesRegex(ValueError, "ISO-10303-21"):
                 parse_stp_deep(str(path))
+
+    def test_three_way_recall_skips_invalid_index_candidate(self):
+        import tempfile
+        import numpy as np
+
+        class FakeCollection:
+            @staticmethod
+            def count():
+                return 1
+
+            @staticmethod
+            def query(**_kwargs):
+                return {
+                    "ids": [["part_0001"]],
+                    "metadatas": [[{"path": invalid_path}]],
+                    "distances": [[0.1]],
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            invalid_path = str(Path(tmp) / "encrypted.stp")
+            Path(invalid_path).write_bytes(b"\x17\xda\x5f\xa0not-a-step-file")
+
+            index = object.__new__(EmbeddingIndex)
+            index.collection = FakeCollection()
+            index.geo_index = None
+            index.visual_index = None
+            index._info_cache = {}
+            index._invalid_info_cache = {}
+
+            candidates, *_ = index.three_way_recall(
+                query_path=str(Path(tmp) / "query.stp"),
+                query_text="valid query description",
+                query_info={"mfg_features": {}},
+                query_geo_vector=np.zeros(64, dtype=np.float32),
+            )
+
+            self.assertEqual(candidates, [])
+            self.assertIn(invalid_path, index._invalid_info_cache)
 
     def test_search_request_defaults_to_ten_results(self):
         request = SearchRequest(file_id="query-file")

@@ -2143,6 +2143,9 @@ class EmbeddingIndex:
         self.db_path = db_path
         self._info_cache = {}
         self._desc_cache = {}
+        # 记录本进程内已确认损坏的候选，避免每次检索重复解析和刷屏。
+        # 查询件仍由 parse_stp_deep 直接校验，查询文件损坏时应明确终止请求。
+        self._invalid_info_cache: Dict[str, str] = {}
 
         # 几何向量索引 (64维)
         self.geo_index: Optional[GeoVectorIndex] = None
@@ -2184,6 +2187,25 @@ class EmbeddingIndex:
                 metadata={"hnsw:space": "cosine"},
             )
 
+    def _get_candidate_info(self, filepath: str) -> Optional[dict]:
+        """安全读取候选几何信息；坏候选只影响自身，不中断整个检索。"""
+        cached = self._info_cache.get(filepath)
+        if cached is not None:
+            return cached
+        if filepath in self._invalid_info_cache:
+            return None
+
+        try:
+            info = parse_stp_deep(filepath)
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            self._invalid_info_cache[filepath] = message
+            print(f"    [无效候选] 跳过 {Path(filepath).name}: {message}")
+            return None
+
+        self._info_cache[filepath] = info
+        return info
+
     def build_index(self, directory: str, view_dir: str = None):
         """
         构建索引（文本Embedding + 几何向量 + 视觉向量）
@@ -2211,6 +2233,7 @@ class EmbeddingIndex:
             self.geo_index.reset()
         if self.visual_index:
             self.visual_index.reset()
+        self._invalid_info_cache.clear()
 
         existing = self.collection.get()
         if existing['ids']:
@@ -2227,6 +2250,7 @@ class EmbeddingIndex:
 
         total = len(stp_files)
         documents, metadatas, ids = [], [], []
+        valid_stp_files = []
         start = time.time()
 
         for i, fp in enumerate(stp_files, 1):
@@ -2235,6 +2259,7 @@ class EmbeddingIndex:
                 desc = generate_retrieval_description(info)
                 self._info_cache[fp] = info
                 self._desc_cache[fp] = desc
+                valid_stp_files.append(fp)
                 documents.append(desc)
                 metadatas.append({
                     'path': fp,
@@ -2243,7 +2268,7 @@ class EmbeddingIndex:
                     'euler': info['euler'],
                     'bbox': f"{info['bbox_dims'][0]}x{info['bbox_dims'][1]}x{info['bbox_dims'][2]}",
                 })
-                ids.append(f"part_{i:04d}")
+                ids.append(f"part_{len(documents):04d}")
                 elapsed = time.time() - start
                 print(
                     f"\r  [{i}/{total}] ✓ {info['filename']:<30s} "
@@ -2266,12 +2291,17 @@ class EmbeddingIndex:
 
         elapsed = time.time() - start
         print(f"\n\n索引完成: {len(documents)} 个零件 ({elapsed:.1f}s)")
+        invalid_count = total - len(valid_stp_files)
+        if invalid_count:
+            print(f"  [数据清洗] 已排除 {invalid_count} 个无效或无法解析的 STEP 文件")
+
+        valid_total = len(valid_stp_files)
 
         # ========== 构建几何向量索引 ==========
         if self.geo_index:
             print(f"\n  [几何索引] 正在构建...")
             geo_success, geo_failed = 0, 0
-            for i, fp in enumerate(stp_files, 1):
+            for i, fp in enumerate(valid_stp_files, 1):
                 try:
                     info = self._info_cache.get(fp)
                     if info is None:
@@ -2284,7 +2314,7 @@ class EmbeddingIndex:
                     geo_failed += 1
 
                 if i % 50 == 0:
-                    print(f"    几何索引: {i}/{total}")
+                    print(f"    几何索引: {i}/{valid_total}")
 
             self.geo_index.save()
             print(f"  [几何索引] 构建完成: {geo_success} 成功, {geo_failed} 失败")
@@ -2301,7 +2331,7 @@ class EmbeddingIndex:
             view_dir.mkdir(parents=True, exist_ok=True)
 
             visual_success, visual_failed = 0, 0
-            for i, fp in enumerate(stp_files, 1):
+            for i, fp in enumerate(valid_stp_files, 1):
                 try:
                     # 尝试查找已有视图
                     view_paths = find_view_images(fp, str(view_dir))
@@ -2324,7 +2354,7 @@ class EmbeddingIndex:
                         visual_failed += 1
 
                     if i % 50 == 0:
-                        print(f"    视觉索引: {i}/{total}")
+                        print(f"    视觉索引: {i}/{valid_total}")
 
                 except Exception as e:
                     print(f"    警告: {Path(fp).name} 视觉向量提取失败: {e}")
@@ -2354,7 +2384,7 @@ class EmbeddingIndex:
         visual_deleted = (
             self.visual_index.remove_vector(filepath) if self.visual_index else False
         )
-        for cache in (self._info_cache, self._desc_cache):
+        for cache in (self._info_cache, self._desc_cache, self._invalid_info_cache):
             for cached_path in list(cache):
                 if os.path.normcase(os.path.abspath(cached_path)) == target:
                     cache.pop(cached_path, None)
@@ -2495,13 +2525,9 @@ class EmbeddingIndex:
         # 计算混合相似度并排序
         output = []
         for path, result in all_candidates.items():
-            candidate_info = self._info_cache.get(path)
+            candidate_info = self._get_candidate_info(path)
             if candidate_info is None:
-                try:
-                    candidate_info = parse_stp_deep(path)
-                    self._info_cache[path] = candidate_info
-                except:
-                    continue
+                continue
 
             if candidate_info:
                 geo_sim = calculate_geometric_similarity(query_info, candidate_info)
@@ -2565,13 +2591,9 @@ class EmbeddingIndex:
                 continue
 
             # 获取零件几何信息
-            candidate_info = self._info_cache.get(path)
+            candidate_info = self._get_candidate_info(path)
             if candidate_info is None:
-                try:
-                    candidate_info = parse_stp_deep(path)
-                    self._info_cache[path] = candidate_info
-                except:
-                    continue
+                continue
 
             # 计算几何相似度得分
             score = 0
@@ -2626,21 +2648,13 @@ class EmbeddingIndex:
                                  include_geometric: bool) -> list[dict]:
         """处理检索结果，计算几何相似度"""
         output = []
-        cache_miss_count = 0
 
         for i in range(len(results['ids'][0])):
             meta = results['metadatas'][0][i]
             candidate_path = meta['path']
-            candidate_info = self._info_cache.get(candidate_path)
-
-            if include_geometric and candidate_info is None:
-                try:
-                    candidate_info = parse_stp_deep(candidate_path)
-                    self._info_cache[candidate_path] = candidate_info
-                except Exception as e:
-                    cache_miss_count += 1
-                    if cache_miss_count == 1:
-                        print(f"  [警告] 部分候选零件无法解析几何信息: {e}")
+            candidate_info = self._get_candidate_info(candidate_path)
+            if candidate_info is None:
+                continue
 
             result = {
                 'filename': meta['filename'],
@@ -2651,7 +2665,7 @@ class EmbeddingIndex:
                 'metadata': meta,
             }
 
-            if include_geometric and candidate_info:
+            if include_geometric:
                 geo_sim = calculate_geometric_similarity(query_info, candidate_info)
                 result['geometric_similarity'] = geo_sim
                 result['hybrid_similarity'] = round(
@@ -2798,8 +2812,16 @@ class EmbeddingIndex:
         # ========== 4. 合并去重 ==========
         all_filepaths = set(text_results.keys()) | set(geo_results.keys()) | set(visual_results.keys())
         merged: List[dict] = []
+        invalid_candidate_count = 0
 
         for fp in all_filepaths:
+            # 历史索引中可能残留已损坏、加密或被错误改名的文件。它们即使仍有
+            # 六视图缓存，也不能参与几何/制造特征计算，必须从本次候选中剔除。
+            cand_info = self._get_candidate_info(fp)
+            if cand_info is None:
+                invalid_candidate_count += 1
+                continue
+
             item = {
                 'filepath': fp,
                 'filename': Path(fp).name,
@@ -2826,9 +2848,6 @@ class EmbeddingIndex:
                 item['recall_count'] += 1
 
             # 制造特征相似度（不依赖独立召回通道，所有合并候选均计算）
-            cand_info = self._info_cache.get(fp) or parse_stp_deep(fp)
-            if fp not in self._info_cache:
-                self._info_cache[fp] = cand_info
             q_mfg = query_info.get('mfg_features', {})
             c_mfg = cand_info.get('mfg_features', {})
             if q_mfg and c_mfg:
@@ -2843,6 +2862,12 @@ class EmbeddingIndex:
 
         # 过滤测试零件
         merged = [item for item in merged if '测试件' not in Path(item['filepath']).stem]
+
+        if invalid_candidate_count:
+            print(
+                f"    [数据清洗] 本次召回跳过 {invalid_candidate_count} 个无效 STEP 候选；"
+                "请重建该零件库索引以永久清除残留"
+            )
 
         print(f"    [合并去重] {len(merged)} 个候选（已过滤测试零件）")
         for i, c in enumerate(merged, 1):
@@ -3101,15 +3126,9 @@ class EmbeddingIndex:
             filepath = cand['filepath']
 
             # 获取候选零件信息
-            if filepath in self._info_cache:
-                cand_info = self._info_cache[filepath]
-            else:
-                try:
-                    cand_info = parse_stp_deep(filepath)
-                    self._info_cache[filepath] = cand_info
-                except Exception as e:
-                    print(f"    警告: {filepath} 解析失败: {e}")
-                    continue
+            cand_info = self._get_candidate_info(filepath)
+            if cand_info is None:
+                continue
 
             # 计算完整几何相似度
             geo_sim = calculate_geometric_similarity(query_info, cand_info)
