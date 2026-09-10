@@ -1274,6 +1274,19 @@ def extract_manufacturing_features_standalone(entities: dict, info: dict) -> dic
             else:
                 mfg['slots'] += 1
 
+    # 特征识别 1.1：使用 STEP B-Rep 的面方向、内外边界和同轴关系。
+    # 保留上面的 1.0 逻辑作为兼容回退；1.1 可用时覆盖孔/槽字段，但不改变
+    # API 的任何请求字段或响应字段。
+    try:
+        from app.cad_features import recognize_features_v11
+
+        recognized = recognize_features_v11(entities, info)
+        if recognized is not None:
+            mfg.update(recognized)
+            total_holes = mfg['through_holes'] + mfg['blind_holes']
+    except Exception as exc:
+        print(f"  [特征识别1.1] 回退到1.0启发式算法: {type(exc).__name__}: {exc}")
+
     # ========== 3. 凸台检测 ==========
     # 检测CYLINDRICAL_SURFACE在Z轴范围超出主体包围盒
     # 以及从主体表面突出的PLANE面
