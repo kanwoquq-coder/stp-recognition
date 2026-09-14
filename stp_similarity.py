@@ -2346,15 +2346,18 @@ class EmbeddingIndex:
             visual_success, visual_failed = 0, 0
             for i, fp in enumerate(valid_stp_files, 1):
                 try:
-                    # 尝试查找已有视图
+                    # 先查找已有视图；渲染能力可用时仍统一经过版本化渲染器。
+                    # render_to_cache 会验证 manifest/source/version：V3 缓存直接
+                    # 复用，V2 或无 manifest 的旧坐标视图会自动重新渲染。
                     view_paths = find_view_images(fp, str(view_dir))
                     valid_views = [v for v in (view_paths or []) if v and Path(v).exists()]
 
-                    # 视图不足时尝试渲染
-                    if len(valid_views) < 3 and HAS_RENDER:
+                    if HAS_RENDER:
                         rendered = self._render_views(fp, str(view_dir))
                         if rendered:
-                            valid_views = rendered
+                            valid_views = [
+                                v for v in rendered if v and Path(v).exists()
+                            ]
 
                     if len(valid_views) >= 3:
                         visual_vector = extract_visual_vector_standalone(valid_views)
