@@ -12,9 +12,12 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from scipy.ndimage import binary_erosion, binary_fill_holes, distance_transform_edt, label
 from scipy.optimize import linear_sum_assignment
 
-RENDER_VERSION = "canonical-ortho-v2"
+# Changing this value intentionally invalidates all old render manifests.  V3
+# keeps the query views fixed and improves candidate orientation matching.
+RENDER_VERSION = "canonical-ortho-v3"
 VIEW_AXES = {
     "front": ((0, 0, 1), (0, 1, 0)),
     "back": ((0, 0, -1), (0, 1, 0)),
@@ -24,6 +27,14 @@ VIEW_AXES = {
     "right": ((1, 0, 0), (0, 1, 0)),
 }
 VIEW_NAMES = tuple(VIEW_AXES)
+VIEW_MATCH_WEIGHTS = {
+    "front": 0.25,
+    "back": 0.15,
+    "top": 0.17,
+    "bottom": 0.13,
+    "left": 0.15,
+    "right": 0.15,
+}
 
 
 def canonical_frame(points, triangles):
@@ -234,17 +245,94 @@ def _read_feature(path):
     dy = int(round((side - 1 - yy.min() - yy.max()) / 2))
     canvas.paste(image, (dx, dy))
     arr = np.asarray(canvas.resize((96, 96), Image.Resampling.LANCZOS), dtype=float)
-    return np.min(arr, axis=2) < 240, 1.0 - arr.mean(axis=2) / 255.0
+    mask = np.min(arr, axis=2) < 240
+    outer = binary_fill_holes(mask)
+    holes = np.logical_and(outer, np.logical_not(mask))
+    components, count = label(holes)
+    filtered_holes = np.zeros_like(holes)
+    minimum_hole_area = max(4, int(mask.sum() * 0.001))
+    kept = 0
+    for component_id in range(1, count + 1):
+        component = components == component_id
+        if int(component.sum()) >= minimum_hole_area:
+            filtered_holes |= component
+            kept += 1
+    edges = np.logical_xor(outer, binary_erosion(outer))
+    return {
+        "mask": mask,
+        "outer": outer,
+        "holes": filtered_holes,
+        "hole_count": kept,
+        "edges": edges,
+        "gray": 1.0 - arr.mean(axis=2) / 255.0,
+    }
+
+
+def _iou(a, b) -> float:
+    union = np.logical_or(a, b)
+    return float(np.logical_and(a, b).sum() / max(union.sum(), 1))
+
+
+def _aspect_score(a, b) -> float:
+    def aspect(mask):
+        yy, xx = np.where(mask)
+        if not len(xx):
+            return 0.0
+        width = float(xx.max() - xx.min() + 1)
+        height = float(yy.max() - yy.min() + 1)
+        return width / max(height, 1.0)
+
+    aa, ba = aspect(a), aspect(b)
+    return min(aa, ba) / max(aa, ba, 1e-8)
+
+
+def _chamfer_score(a_edges, b_edges) -> float:
+    if not a_edges.any() or not b_edges.any():
+        return 0.0
+    distance_to_a = distance_transform_edt(np.logical_not(a_edges))
+    distance_to_b = distance_transform_edt(np.logical_not(b_edges))
+    distance = 0.5 * (
+        float(distance_to_a[b_edges].mean())
+        + float(distance_to_b[a_edges].mean())
+    )
+    # 12 pixels at 96x96 is already a substantial contour displacement.
+    return max(0.0, 1.0 - distance / 12.0)
+
+
+def _hole_score(a, b) -> float:
+    a_count, b_count = a["hole_count"], b["hole_count"]
+    if a_count == 0 and b_count == 0:
+        return 1.0
+    count_score = 1.0 - abs(a_count - b_count) / max(a_count, b_count, 1)
+    if a_count == 0 or b_count == 0:
+        return 0.25 * count_score
+    return 0.45 * count_score + 0.55 * _iou(a["holes"], b["holes"])
 
 
 def _similarity(a, b, turns):
-    am, ag = a
-    bm, bg = (np.rot90(v, turns) for v in b)
-    union = np.logical_or(am, bm)
-    iou = np.logical_and(am, bm).sum() / max(union.sum(), 1)
-    # Silhouette includes through-holes. Shading is a weak secondary cue only.
-    gray = max(0.0, 1.0 - float(np.abs(ag[union] - bg[union]).mean()) * 3)
-    return float(0.85 * iou + 0.15 * gray)
+    rotated = {
+        key: (np.rot90(value, turns) if isinstance(value, np.ndarray) else value)
+        for key, value in b.items()
+    }
+    union = np.logical_or(a["outer"], rotated["outer"])
+    silhouette = _iou(a["mask"], rotated["mask"])
+    chamfer = _chamfer_score(a["edges"], rotated["edges"])
+    holes = _hole_score(a, rotated)
+    aspect = _aspect_score(a["outer"], rotated["outer"])
+    gray = max(
+        0.0,
+        1.0
+        - float(np.abs(a["gray"][union] - rotated["gray"][union]).mean()) * 3,
+    )
+    # Shape is dominant; holes and contour distance disambiguate visually
+    # similar thin side views.  No learned model is involved.
+    return float(
+        0.40 * silhouette
+        + 0.20 * chamfer
+        + 0.20 * holes
+        + 0.10 * aspect
+        + 0.10 * gray
+    )
 
 
 def match_views(query_paths, candidate_paths, method="rigid24"):
@@ -257,14 +345,23 @@ def match_views(query_paths, candidate_paths, method="rigid24"):
     cfeat = [_read_feature(candidate[n]) for n in VIEW_NAMES]
     scores = np.array([[[_similarity(a, b, k) for k in range(4)] for b in cfeat] for a in qfeat])
     row, col = linear_sum_assignment(scores.max(axis=2), maximize=True)
-    upper = float(scores.max(axis=2)[row, col].mean())
+    query_weights = np.asarray([VIEW_MATCH_WEIGHTS[name] for name in VIEW_NAMES])
+    upper = float(np.average(scores.max(axis=2)[row, col], weights=query_weights[row]))
     rotations = []
     for rotation in cube_rotations():
         assignment = rotation_assignment(rotation)
-        score = np.mean([scores[VIEW_NAMES.index(q), VIEW_NAMES.index(c), k] for q, c, k in assignment])
-        rotations.append((float(score), rotation, assignment))
-    rotations.sort(key=lambda item: item[0], reverse=True)
-    score, rotation, assignment = rotations[0]
+        pair_scores = {
+            q: float(scores[VIEW_NAMES.index(q), VIEW_NAMES.index(c), k])
+            for q, c, k in assignment
+        }
+        weighted_mean = sum(
+            VIEW_MATCH_WEIGHTS[name] * pair_scores[name] for name in VIEW_NAMES
+        ) / sum(VIEW_MATCH_WEIGHTS.values())
+        # Front is the user's standard view.  Minimum per-view similarity is a
+        # final tie-breaker that rejects a rotation with one obviously wrong side.
+        rotations.append((float(weighted_mean), pair_scores["front"], min(pair_scores.values()), rotation, assignment))
+    rotations.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    score, _, _, rotation, assignment = rotations[0]
     gap = score - rotations[1][0]
     if method == "hungarian":
         assignment = [(VIEW_NAMES[i], VIEW_NAMES[j], int(scores[i, j].argmax())) for i, j in zip(row, col)]

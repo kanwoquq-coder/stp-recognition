@@ -309,7 +309,7 @@ class BuildIndexResponse(BaseModel):
 
 
 class SearchRequest(FileReference):
-    include_view_alignment: bool = Field(default=False, description="是否为最终结果补充六视图配对；需CAD渲染依赖，首次升级旧图较慢，也可在详情页单独调用/api/render/match")
+    include_view_alignment: bool = Field(default=True, description="是否为最终结果补充六视图配对；默认以查询件为标准自动返回aligned_views，无需单独调用/api/render/match")
     library_id: str | None = Field(default="default", description="旧版单零件库 ID；建议新前端使用 library_ids")
     library_ids: list[str] = Field(default_factory=list, description="目标零件库 ID 列表，支持一次选择多个独立零件库")
     result_limit: int | None = Field(default=None, ge=1, le=50, description="最终返回数量，对应前端数量选择器")

@@ -87,6 +87,10 @@ class RerankCompletionTests(unittest.TestCase):
         request = SearchRequest(file_id="query-file")
         self.assertTrue(request.use_three_way)
 
+    def test_search_request_aligns_result_views_by_default(self):
+        request = SearchRequest(file_id="query-file")
+        self.assertTrue(request.include_view_alignment)
+
     def test_result_limit_overrides_legacy_final_top(self):
         request = SearchRequest(
             file_id="query-file", result_limit=10, final_top=5
